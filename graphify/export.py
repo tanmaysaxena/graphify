@@ -14,7 +14,7 @@ import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label
 from graphify.analyze import _node_community_map
-from graphify.build import edge_data
+from graphify.build import edge_data, _check_per_file_layer_shrink
 
 
 # Artifacts worth preserving across rebuilds (non-regenerable without LLM or curation).
@@ -536,6 +536,26 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     commit = built_at_commit if built_at_commit is not None else _git_head()
     if commit:
         data["built_at_commit"] = commit
+
+    # mindfarm fork patch (root cause 1c — see PD32/PD36/PD41 in the
+    # consuming repo's decision log): the whole-graph guard above is
+    # skippable via force=True, which callers legitimately pass after a
+    # refactor that deletes real code. That same force=True also silently
+    # waives protection against an UNRELATED file's layer disappearing in the
+    # same write. This second, additive guard runs regardless of force — it
+    # never needs a bypass, because a legitimate full-file removal is already
+    # exempted inside the guard itself (see its own docstring in build.py).
+    if existing_path.exists():
+        try:
+            from graphify.security import check_graph_file_size_cap
+            check_graph_file_size_cap(existing_path)
+            existing_data_for_layer_check = json.loads(existing_path.read_text(encoding="utf-8"))
+            existing_layer_nodes = existing_data_for_layer_check.get("nodes", [])
+        except Exception:
+            existing_layer_nodes = None  # unreadable existing file — nothing to compare against
+        if existing_layer_nodes is not None:
+            _check_per_file_layer_shrink(existing_layer_nodes, data["nodes"], context="(export.to_json)")
+
     with open(output_path, "w", encoding="utf-8") as f:  # nosec
         json.dump(data, f, indent=2)
     return True
