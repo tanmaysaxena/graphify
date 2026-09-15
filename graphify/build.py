@@ -71,6 +71,58 @@ def _norm_source_file(p: str | None, root: str | None = None) -> str | None:
     return p
 
 
+def _check_per_file_layer_shrink(existing_nodes: list[dict], new_nodes: list[dict], *, context: str = "") -> None:
+    """Refuse a merge that silently drops an entire (source_file, _origin) layer
+    for a file that still has content in the result.
+
+    mindfarm fork patch — see PD32/PD36/PD41 in the consuming repo's decision
+    log. Whole-graph node-count guards (the ones this function's callers used
+    to rely on exclusively) can't see this: a merge that adds enough new nodes
+    elsewhere masks one file losing its whole AST or semantic layer, and both
+    of graphify's original guards were additionally skippable — one whenever
+    dedup=True (the common case), the other via force=True. This groups both
+    node sets by (source_file, _origin) and raises if any group that existed
+    before has zero members after, UNLESS the whole file is also absent from
+    the new set (a legitimate full removal — already handled by prune_sources/
+    deleted-file logic elsewhere, not this guard's concern).
+    """
+    from collections import defaultdict
+
+    def _groups(nodes: list[dict]) -> dict[tuple, set]:
+        g: dict[tuple, set] = defaultdict(set)
+        for n in nodes:
+            sf = n.get("source_file")
+            if not sf:
+                continue
+            g[(sf, n.get("_origin"))].add(n.get("id"))
+        return g
+
+    before = _groups(existing_nodes)
+    after = _groups(new_nodes)
+    after_files = {sf for (sf, _origin) in after}
+
+    lost = []
+    for (sf, origin), ids in before.items():
+        if not ids or (sf, origin) in after:
+            continue
+        if sf not in after_files:
+            continue  # whole file legitimately gone — not this guard's concern
+        lost.append((sf, origin, len(ids)))
+
+    if lost:
+        detail = "; ".join(
+            f"{sf!r} lost its {origin or 'semantic'!r} layer ({n} node(s))"
+            for sf, origin, n in lost[:10]
+        )
+        more = f" (+{len(lost) - 10} more)" if len(lost) > 10 else ""
+        raise ValueError(
+            f"graphify: merge{(' ' + context) if context else ''} would silently drop "
+            f"an entire node layer for file(s) still present in the result: "
+            f"{detail}{more}. This is the shape of a known bug class (layer "
+            f"eviction during merge) — refusing rather than writing a corrupted graph."
+        )
+
+
 def edge_data(G: nx.Graph, u: str, v: str) -> dict:
     """Return one edge attribute dict for (u, v), tolerating MultiGraph.
 
@@ -377,6 +429,27 @@ def build(
             combined["nodes"], combined["edges"], communities={},
             dedup_llm_backend=dedup_llm_backend,
         )
+
+    # mindfarm fork patch (root cause 2 — bare file-anchor id collisions, see
+    # PD37 in the consuming repo's decision log): extract._disambiguate_
+    # colliding_node_ids() only ever runs inside a single extract() call's own
+    # AST pass, so a collision group whose members were extracted in SEPARATE
+    # extract() calls (different sessions/commits merged together here) never
+    # gets disambiguated — merge is plain last-writer-wins on id instead.
+    # Re-run the same disambiguation on this call's COMBINED node set so a
+    # collision spanning multiple merges is still caught. Scoped to
+    # _origin=="ast" nodes only: semantic/LLM nodes legitimately share a
+    # file's own anchor id as an intentional cross-reference (graphify's own
+    # documented convention — extraction-spec.md), and running this over the
+    # full node set would incorrectly split that legitimate linkage. Real
+    # id collisions between two genuine file anchors are always both
+    # AST-origin, so this scoping loses no real coverage.
+    _ast_nodes = [n for n in combined["nodes"] if isinstance(n, dict) and n.get("_origin") == "ast"]
+    if len(_ast_nodes) >= 2:
+        from graphify.extract import _disambiguate_colliding_node_ids
+        _root = Path(root).resolve() if root is not None else Path.cwd()
+        _disambiguate_colliding_node_ids(_ast_nodes, combined["edges"], [], _root)
+
     return build_from_json(combined, directed=directed, root=root)
 
 
@@ -485,6 +558,18 @@ def build_merge(
     # absolute win32 paths while the stored graph keeps relative posix (#1007).
     _replace_root = str(Path(root).resolve()) if root is not None else None
     new_sources: set[str] = set()
+    # mindfarm fork patch (root cause 1a — see PD32 in the consuming repo's
+    # decision log): track WHICH _origin layer(s) new_chunks actually
+    # re-provides per file, not just which files it touches. The original
+    # `_kept()` dropped every existing node/edge for a touched source_file
+    # regardless of layer, so a semantic-only update (no _origin key on any
+    # new node) silently destroyed that file's AST heading layer, and an
+    # AST-only update (watch.py's incremental rebuild) silently destroyed the
+    # semantic layer — neither update path ever regenerates the layer it
+    # doesn't touch, so the dropped layer was gone for good until a repair
+    # script spliced it back in from elsewhere. Only drop an item if the
+    # incoming update re-provides its OWN layer for that file.
+    new_source_origins: dict[str, set] = {}
     for ch in new_chunks:
         for n in ch.get("nodes", []):
             sf = n.get("source_file")
@@ -494,17 +579,68 @@ def build_merge(
             norm = _norm_source_file(sf, _replace_root)
             if norm:
                 new_sources.add(norm)
+            for key in (sf, norm):
+                if key:
+                    new_source_origins.setdefault(key, set()).add(n.get("_origin"))
+
     if new_sources:
-        def _kept(item: dict) -> bool:
-            sf = item.get("source_file")
-            return sf not in new_sources and _norm_source_file(sf, _replace_root) not in new_sources
-        existing_nodes = [n for n in existing_nodes if _kept(n)]
-        existing_edges = [e for e in existing_edges if _kept(e)]
+        existing_origin_by_id = {n.get("id"): n.get("_origin") for n in existing_nodes if n.get("id")}
+
+        def _touched(sf: str | None) -> bool:
+            return sf in new_sources or _norm_source_file(sf, _replace_root) in new_sources
+
+        def _provided(sf: str | None) -> set:
+            norm = _norm_source_file(sf, _replace_root)
+            return new_source_origins.get(sf) or new_source_origins.get(norm) or set()
+
+        def _kept_node(n: dict) -> bool:
+            sf = n.get("source_file")
+            if not _touched(sf):
+                return True
+            return n.get("_origin") not in _provided(sf)
+
+        def _kept_edge(e: dict) -> bool:
+            sf = e.get("source_file")
+            if not _touched(sf):
+                return True
+            provided = _provided(sf)
+            # An edge carries no _origin of its own — infer its layer from its
+            # endpoints' existing layer so an edge between two preserved
+            # same-layer nodes survives with them. An edge whose endpoints
+            # disagree on layer (or aren't found) is conservatively dropped;
+            # it is rebuilt whenever a future update touches that layer.
+            src_origin = existing_origin_by_id.get(e.get("source"))
+            tgt_origin = existing_origin_by_id.get(e.get("target"))
+            if src_origin != tgt_origin:
+                return False
+            return src_origin not in provided
+
+        _pre_filter_nodes = existing_nodes
+        existing_nodes = [n for n in existing_nodes if _kept_node(n)]
+        existing_edges = [e for e in existing_edges if _kept_edge(e)]
+    else:
+        _pre_filter_nodes = existing_nodes
 
     base = [{"nodes": existing_nodes, "edges": existing_edges}] if had_graph else []
 
     all_chunks = base + list(new_chunks)
     G = build(all_chunks, directed=directed, dedup=dedup, dedup_llm_backend=dedup_llm_backend, root=root)
+
+    # mindfarm fork patch (root cause 1c — see PD32/PD36/PD41): a per-file,
+    # per-layer shrink guard that runs UNCONDITIONALLY, unlike the two
+    # existing whole-graph guards below and in export.to_json(), which are
+    # both skippable (dedup=True — the default — skips the one below; force=
+    # True skips export's). Compares this call's ORIGINAL existing_nodes
+    # (before the _kept() filter above) against the final built graph, so it
+    # also catches a layer loss introduced by dedup's own entity-merging, not
+    # just by _kept(). No force-bypass: legitimately deleted files are
+    # already exempted inside the guard itself (see its own docstring), so
+    # nothing legitimate needs an escape hatch here.
+    _check_per_file_layer_shrink(
+        _pre_filter_nodes,
+        [dict(id=n, **d) for n, d in G.nodes(data=True)],
+        context="(build_merge)",
+    )
 
     # Prune nodes and edges from deleted source files
     if prune_sources:
