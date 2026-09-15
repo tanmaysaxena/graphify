@@ -580,10 +580,24 @@ def _rebuild_code(
                 new_ast_ids = {n["id"] for n in result["nodes"]}
                 _relativize_source_files(existing, project_root)
                 evict_sources: set[str] = set(deleted_paths)
+                # mindfarm fork patch (root cause 1b — see PD36 in the
+                # consuming repo's decision log): re_extracted_sources tracks
+                # files that were re-extracted but still EXIST, separately
+                # from deleted_paths (files genuinely gone). The original
+                # code folded both into evict_sources and evicted every node
+                # — AST or semantic — for any file in it. That's correct for
+                # deleted_paths (the file is gone, evict everything) but
+                # wrong for re_extracted_sources: this AST-only incremental
+                # rebuild never re-provides a file's semantic layer, so
+                # evicting semantic nodes here destroys them with nothing in
+                # this pass able to put them back.
+                re_extracted_sources: set[str] = set()
                 if changed_paths is not None:
                     for p in extract_targets:
                         for root in (project_root, watch_root):
-                            evict_sources.add(_nsf(str(p), str(root)) or str(p))
+                            _s = _nsf(str(p), str(root)) or str(p)
+                            evict_sources.add(_s)
+                            re_extracted_sources.add(_s)
                 else:
                     # Full re-extraction: reconcile against current code files to
                     # evict nodes from files deleted since the last run (#1007).
@@ -609,15 +623,30 @@ def _rebuild_code(
                 # missing from it is stale and must be dropped even if its source
                 # file still exists (a symbol removed from a surviving file, #1116).
                 # Gate on full_rebuild: in incremental mode an AST node from an
-                # unchanged file is legitimately absent from new_ast_ids. Semantic
-                # nodes lack the "_origin" marker, so they are never dropped here —
-                # only by the deleted-file eviction in evict_sources above.
+                # unchanged file is legitimately absent from new_ast_ids.
+                #
+                # mindfarm fork patch: the ORIGINAL comment here claimed
+                # "Semantic nodes lack the _origin marker, so they are never
+                # dropped here -- only by the deleted-file eviction in
+                # evict_sources above" -- that was FALSE about the code's own
+                # behavior: evict_sources (before this patch) included every
+                # re-extracted-but-still-existing file too, not just deleted
+                # ones, so a semantic node for a re-extracted file WAS
+                # silently dropped here with nothing to restore it (PD36).
+                # Eviction is now split: deleted_paths (file genuinely gone)
+                # evicts every node regardless of layer; re_extracted_sources
+                # (file re-extracted but still exists) evicts only its own
+                # _origin=='ast' nodes, preserving that file's semantic layer.
                 full_rebuild = changed_paths is None
                 preserved_nodes = [
                     n for n in existing.get("nodes", [])
                     if n["id"] not in new_ast_ids
                     and not (full_rebuild and n.get("_origin") == "ast")
-                    and (not evict_sources or n.get("source_file") not in evict_sources)
+                    and n.get("source_file") not in deleted_paths
+                    and not (
+                        n.get("source_file") in re_extracted_sources
+                        and n.get("_origin") == "ast"
+                    )
                 ]
                 all_ids = new_ast_ids | {n["id"] for n in preserved_nodes}
                 preserved_edges = [
