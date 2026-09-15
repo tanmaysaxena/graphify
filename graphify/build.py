@@ -123,6 +123,67 @@ def _check_per_file_layer_shrink(existing_nodes: list[dict], new_nodes: list[dic
         )
 
 
+def _check_reextraction_scope_flood(
+    pre_filter_nodes: list[dict],
+    new_sources: set[str],
+    *,
+    dedup: bool,
+    allow: bool,
+    threshold: float = 0.5,
+    min_existing_files: int = 20,
+    context: str = "",
+) -> None:
+    """Refuse a dedup-enabled merge that re-extracts an implausibly large
+    fraction of the existing corpus in one call.
+
+    mindfarm fork patch — see PD41/PD48 in the consuming repo's decision log.
+    The PD41 incident traces to a step *before* dedup ever ran: a stale or
+    root-mismatched manifest.json made detect_incremental() fall into its
+    "unknown format, re-extract to be safe" fallback for nearly the whole
+    corpus (213 of ~230 files, when only a handful had actually changed).
+    That flood then fed build_merge()'s default dedup=True corpus-wide
+    fuzzy-dedup pass, which collapsed 78 unrelated nodes as false-positive
+    duplicates. `_check_per_file_layer_shrink` (root cause 1c) catches a
+    file's layer being wiped to zero, but not a *partial* loss — some nodes
+    in a touched file surviving while others get silently merged away — which
+    is exactly what happened to dev_docs/decisions.md and the handoff docs
+    that incident. This guard catches the flood itself, before dedup ever
+    runs, rather than trying to characterize every possible shape of damage
+    dedup could produce from it.
+
+    Heuristic, not proof: a genuinely large, intended bulk update (a
+    repo-wide rename, a first full-corpus backfill) will also trip this.
+    That is why the escape hatch is an explicit kwarg on build_merge()
+    (`allow_reextraction_flood=True`), not a silent default — the operator
+    has to say "yes, I really mean this", the same explicit-widening
+    principle the consuming repo's own check_dedup_scope_safety.py already
+    established for its own --scope flag. That script stays useful for
+    narrower, operator-declared-scope violations this corpus-wide ratio
+    check can't see; this guard exists so the common flood shape (PD41's
+    own incident) is caught automatically, with no manual step required.
+    """
+    if allow or not dedup or not new_sources:
+        return
+    existing_sources = {n.get("source_file") for n in pre_filter_nodes if n.get("source_file")}
+    if len(existing_sources) < min_existing_files:
+        return  # too small a corpus for a ratio to mean anything
+    touched = existing_sources & new_sources
+    ratio = len(touched) / len(existing_sources)
+    if ratio < threshold:
+        return
+    raise ValueError(
+        f"graphify: merge{(' ' + context) if context else ''} refusing to proceed: "
+        f"{len(touched)}/{len(existing_sources)} ({ratio:.0%}) of the existing "
+        f"corpus's files appear in this call's new_chunks, with dedup enabled. "
+        f"This matches the shape of a stale/root-mismatched manifest flooding "
+        f"detect_incremental()'s changed-file list (see PD41), not a normal "
+        f"incremental update — refusing rather than risking a corpus-wide "
+        f"fuzzy-dedup pass over files that were never meant to be touched. If "
+        f"this really is an intended full-corpus re-extraction, pass "
+        f"allow_reextraction_flood=True to build_merge() explicitly."
+    )
+
+
 def edge_data(G: nx.Graph, u: str, v: str) -> dict:
     """Return one edge attribute dict for (u, v), tolerating MultiGraph.
 
@@ -516,6 +577,7 @@ def build_merge(
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
+    allow_reextraction_flood: bool = False,
 ) -> nx.Graph:
     """Load existing graph.json, merge new chunks into it, and save back.
 
@@ -525,6 +587,10 @@ def build_merge(
     preserved unchanged; deleted files are removed via prune_sources.
     Safe to call repeatedly.
     root: if given, absolute source_file paths in new_chunks are made relative (#932).
+    allow_reextraction_flood: mindfarm fork patch (PD41) — set True to bypass
+        _check_reextraction_scope_flood's refusal when new_chunks genuinely,
+        intentionally covers a large fraction of the existing corpus with
+        dedup enabled. See that function's docstring.
     """
     graph_path = Path(graph_path if graph_path is not None else _default_graph_json())
     if graph_path.exists():
@@ -582,6 +648,17 @@ def build_merge(
             for key in (sf, norm):
                 if key:
                     new_source_origins.setdefault(key, set()).add(n.get("_origin"))
+
+    # mindfarm fork patch (root cause "root-drift-floods-scope" — see PD41):
+    # check BEFORE the _kept() filtering below and before dedup ever runs,
+    # against the corpus as it stood coming into this call.
+    _check_reextraction_scope_flood(
+        existing_nodes,
+        new_sources,
+        dedup=dedup,
+        allow=allow_reextraction_flood,
+        context="(build_merge)",
+    )
 
     if new_sources:
         existing_origin_by_id = {n.get("id"): n.get("_origin") for n in existing_nodes if n.get("id")}
