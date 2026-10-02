@@ -425,6 +425,12 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             tgt_ext = Path(G.nodes[tgt].get("source_file") or "").suffix.lower()
             if src_ext and tgt_ext and _LANG_FAMILY.get(src_ext) != _LANG_FAMILY.get(tgt_ext):
                 continue
+        # mindfarm fork patch: an LLM-extracted edge can carry "weight": null
+        # (seen in a semantic cache entry). networkx's weighted degree then
+        # computes int + None and Louvain clustering crashes, failing every
+        # later rebuild. Every other edge's weight is 1.0, so default to that.
+        if "weight" in attrs and not isinstance(attrs["weight"], (int, float)):
+            attrs["weight"] = 1.0
         # Preserve original edge direction - undirected graphs lose it otherwise,
         # causing display functions to show edges backwards.
         attrs["_src"] = src
